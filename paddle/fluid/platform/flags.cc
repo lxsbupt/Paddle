@@ -65,6 +65,19 @@ PADDLE_DEFINE_EXPORTED_bool(
     "Checking whether operator produce NAN/INF or not. It will be "
     "extremely slow so please use this flag wisely.");
 
+/**
+ * Operator related FLAG
+ * Name: FLAGS_check_nan_inf
+ * Since Version: 0.13.0
+ * Value Range: bool, default=false
+ * Example:
+ * Note: Used to debug. Checking whether operator produce NAN/INF or not.
+ */
+PADDLE_DEFINE_EXPORTED_bool(
+    enable_opt_get_features, false,
+    "Checking whether operator produce NAN/INF or not. It will be "
+    "extremely slow so please use this flag wisely.");
+
 // NOTE(zhiqiu): better to share the flags, otherwise we will have too many
 // flags.
 #if defined(PADDLE_WITH_CUDA) || defined(PADDLE_WITH_HIP) || \
@@ -712,6 +725,19 @@ PADDLE_DEFINE_EXPORTED_int32(get_host_by_name_time, 120,
 PADDLE_DEFINE_EXPORTED_bool(
     apply_pass_to_program, false,
     "It controls whether to apply IR pass to program when using Fleet APIs");
+
+/**
+ * Distributed related FLAG
+ * Name: FLAGS_graph_load_in_parallel
+ * Since Version: 2.2.0
+ * Value Range: bool, default=false
+ * Example:
+ * Note: Control whether load graph node and edge with multi threads parallely
+ *       If it is not set, load graph data with one thread
+ */
+PADDLE_DEFINE_EXPORTED_bool(
+    graph_load_in_parallel, false,
+    "It controls whether load graph node and edge with mutli threads parallely.");
 
 /**
  * KP kernel related FLAG
