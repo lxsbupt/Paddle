@@ -22,9 +22,42 @@ limitations under the License. */
 #endif
 
 DECLARE_double(gpugraph_hbm_table_load_factor);
+DECLARE_bool(gpugraph_enable_hbm_table_direct_access);
 
 namespace paddle {
 namespace framework {
+
+template<typename KEY>
+void show_sharding_result(int gpu_id, int gpu_num, const KEY* d_ids, int len, const char* desc) {
+  KEY* h_nodes = nullptr;
+  size_t size = sizeof(KEY) * len;
+  cudaMallocHost((void**)&h_nodes, size);
+  cudaMemcpy(h_nodes, d_ids, size, cudaMemcpyDeviceToHost);
+
+  typedef std::set<KEY> IDS;
+  std::vector<IDS> sharding_ids(gpu_num);
+  std::vector<int> sharding_res(gpu_num, 0);
+  std::vector<int> sharding_zero(gpu_num, 0);
+  std::vector<int> sharding_total(gpu_num, 0);
+  for (size_t idx = 0; idx < len; ++idx) {
+    auto shard_id = (uint32_t)(h_nodes[idx] % gpu_num);
+    sharding_res[shard_id] += 1;
+    sharding_total[shard_id] += 1;
+    sharding_ids[shard_id].insert(h_nodes[idx]);
+    if (h_nodes[idx] == 0) sharding_zero[shard_id] ++;
+  }
+  for (size_t device_id = 0; device_id < gpu_num; ++device_id) {
+    VLOG(0) << "device " << device_id << ": " << sharding_res[device_id]
+        << ", zero:" << sharding_zero[device_id]
+        << ", unique:" << sharding_ids[device_id].size()
+        << ", total:" << sharding_total[device_id]
+        << ", desc:" << desc;
+  }
+
+  cudaFree(&h_nodes);
+  h_nodes = nullptr;
+}
+
 template <typename KeyType, typename ValType, typename GradType>
 HeterComm<KeyType, ValType, GradType>::HeterComm(
     size_t capacity, std::shared_ptr<HeterPsResource> resource) {
@@ -743,11 +776,21 @@ void HeterComm<KeyType, ValType, GradType>::pull_sparse(int num,
     return;
   }
 
+  platform::Timer timeline;
+  double total_time = 0.0;
+  double prepare_time = 0.0;
+  double split_time = 0.0;
+  double finish_time = 0.0;
+  double get_time = 0.0;
+  timeline.Start();
+
   int total_device = resource_->total_device();
   int dev_id = resource_->dev_id(num);
   DevPlace place = DevPlace(dev_id);
   AnyDeviceGuard guard(dev_id);
   auto stream = resource_->local_stream(num, 0);
+
+  show_sharding_result(dev_id, total_device, d_keys, len, "pull_sparse");
 
   int h_left[total_device];   // NOLINT
   int h_right[total_device];  // NOLINT
@@ -787,6 +830,11 @@ void HeterComm<KeyType, ValType, GradType>::pull_sparse(int num,
   auto d_shard_vals = memory::Alloc(place, len * val_type_size);
   float* d_shard_vals_ptr = reinterpret_cast<float*>(d_shard_vals->ptr());
 
+  timeline.Pause();
+  prepare_time += timeline.ElapsedSec();
+  total_time += timeline.ElapsedSec();
+  timeline.Start();
+
   split_input_to_shard(d_keys, d_idx_ptr, len, d_left_ptr, d_right_ptr, num);
 
   heter_comm_kernel_->fill_shard_key(d_shard_keys_ptr, d_keys, d_idx_ptr, len,
@@ -802,7 +850,7 @@ void HeterComm<KeyType, ValType, GradType>::pull_sparse(int num,
   memory_copy(dst_place, h_right, src_place, d_right_ptr,
               total_device * sizeof(int), stream);
 
-  if (!direct_access_) {
+  if (!FLAGS_gpugraph_enable_hbm_table_direct_access) {
     for (int i = 0; i < total_device; ++i) {
       int shard_len = h_right[i] - h_left[i] + 1;
       if (h_left[i] == -1 || h_right[i] == -1) {
@@ -813,17 +861,23 @@ void HeterComm<KeyType, ValType, GradType>::pull_sparse(int num,
     }
     walk_to_dest(num, total_device, h_left, h_right, d_shard_keys_ptr, NULL);
   }
+
+  timeline.Pause();
+  total_time += timeline.ElapsedSec();
+  split_time += timeline.ElapsedSec();
+  timeline.Start();
+
   for (int i = 0; i < total_device; ++i) {
     if (h_left[i] == -1) {
       continue;
     }
     auto& node = path_[num][i].nodes_.back();
-    if (!direct_access_) {
+    if (!FLAGS_gpugraph_enable_hbm_table_direct_access) {
       sync_stream(node.in_stream);
     }
     AnyDeviceGuard guard(resource_->dev_id(i));
     ptr_tables_[i]->rwlock_->RDLock();
-    if (!direct_access_) {
+    if (!FLAGS_gpugraph_enable_hbm_table_direct_access) {
       ptr_tables_[i]->get(reinterpret_cast<KeyType*>(node.key_storage),
                           node.val_storage, h_right[i] - h_left[i] + 1,
                           resource_->remote_stream(i, num));
@@ -834,6 +888,10 @@ void HeterComm<KeyType, ValType, GradType>::pull_sparse(int num,
           h_right[i] - h_left[i] + 1, resource_->remote_stream(i, num));
     }
   }
+  timeline.Pause();
+  total_time += timeline.ElapsedSec();
+  get_time += timeline.ElapsedSec();
+  timeline.Start();
 
   for (int i = 0; i < total_device; ++i) {
     sync_stream(resource_->remote_stream(i, num));
@@ -842,7 +900,7 @@ void HeterComm<KeyType, ValType, GradType>::pull_sparse(int num,
     }
     ptr_tables_[i]->rwlock_->UNLock();
   }
-  if (!direct_access_) {
+  if (!FLAGS_gpugraph_enable_hbm_table_direct_access) {
     walk_to_src(num, total_device, h_left, h_right,
                 reinterpret_cast<char*>(d_shard_vals_ptr), val_type_size);
     for (int i = 0; i < total_device; ++i) {
@@ -855,7 +913,7 @@ void HeterComm<KeyType, ValType, GradType>::pull_sparse(int num,
                                        val_type_size, stream);
 
   sync_stream(stream);
-  if (!direct_access_) {
+  if (!FLAGS_gpugraph_enable_hbm_table_direct_access) {
     for (int i = 0; i < total_device; ++i) {
       if (h_left[i] == -1 || h_right[i] == -1) {
         continue;
@@ -863,6 +921,14 @@ void HeterComm<KeyType, ValType, GradType>::pull_sparse(int num,
       destroy_storage(num, i);
     }
   }
+
+  timeline.Pause();
+  finish_time += timeline.ElapsedSec();
+  total_time += timeline.ElapsedSec();
+
+  VLOG(0) << "card:" << dev_id << ", heterps pull cost " << total_time
+          << "seconds, " << " get time: " << get_time
+          << "seconds ";
 }
 
 #if defined(PADDLE_WITH_CUDA)
@@ -877,8 +943,18 @@ void HeterComm<KeyType, ValType, GradType>::push_sparse(int dev_num,
     return;
   }
 
+  platform::Timer timeline;
+  double total_time = 0.0;
+  double prepare_time = 0.0;
+  double split_time = 0.0;
+  double finish_time = 0.0;
+  double update_time = 0.0;
+  timeline.Start();
+
   int total_device = resource_->total_device();
   int dev_id = resource_->dev_id(dev_num);
+
+  show_sharding_result(dev_id, total_device, d_keys, len, "push_sparse");
 
   size_t grad_value_size =
         TYPEALIGN(8, feature_value_accessor_.GetAccessorInfo().update_size);
@@ -925,6 +1001,11 @@ void HeterComm<KeyType, ValType, GradType>::push_sparse(int dev_num,
   auto d_shard_grads = memory::Alloc(place, len * grad_value_size);
   d_shard_grads_ptr = reinterpret_cast<float*>(d_shard_grads->ptr());
 
+  timeline.Pause();
+  total_time += timeline.ElapsedSec();
+  prepare_time += timeline.ElapsedSec();
+  timeline.Start();
+
   int uniq_len = len;
   dynamic_merge_grad(dev_num, d_keys, d_grads, len, uniq_len);
 
@@ -946,7 +1027,7 @@ void HeterComm<KeyType, ValType, GradType>::push_sparse(int dev_num,
   memory_copy(dst_place, h_right, src_place, d_right_ptr,
               total_device * sizeof(int), stream);
 
-  if (!direct_access_) {
+  if (!FLAGS_gpugraph_enable_hbm_table_direct_access) {
     for (int i = 0; i < total_device; ++i) {
       int shard_len = h_right[i] - h_left[i] + 1;
       if (h_left[i] == -1 || h_right[i] == -1) {
@@ -960,18 +1041,22 @@ void HeterComm<KeyType, ValType, GradType>::push_sparse(int dev_num,
                   reinterpret_cast<char*>(d_shard_grads_ptr), grad_value_size);
   }
 
+  timeline.Pause();
+  total_time += timeline.ElapsedSec();
+  split_time += timeline.ElapsedSec();
+  timeline.Start();
   for (int i = 0; i < total_device; ++i) {
     if (h_left[i] == -1 || h_right[i] == -1) {
       continue;
     }
     auto& node = path_[dev_num][i].nodes_.back();
-    if (!direct_access_) {
+    if (!FLAGS_gpugraph_enable_hbm_table_direct_access) {
       sync_stream(node.in_stream);
     }
 
     AnyDeviceGuard guard(resource_->dev_id(i));
     ptr_tables_[i]->rwlock_->WRLock();
-    if (!direct_access_) {
+    if (!FLAGS_gpugraph_enable_hbm_table_direct_access) {
       ptr_tables_[i]->update(reinterpret_cast<KeyType*>(node.key_storage),
                               node.val_storage, h_right[i] - h_left[i] + 1,
                               sgd, resource_->remote_stream(i, dev_num));
@@ -983,6 +1068,10 @@ void HeterComm<KeyType, ValType, GradType>::push_sparse(int dev_num,
                               resource_->remote_stream(i, dev_num));
     }
   }
+  timeline.Pause();
+  total_time += timeline.ElapsedSec();
+  update_time += timeline.ElapsedSec();
+  timeline.Start();
 
   for (int i = 0; i < total_device; ++i) {
     sync_stream(resource_->remote_stream(i, dev_num));
@@ -995,7 +1084,7 @@ void HeterComm<KeyType, ValType, GradType>::push_sparse(int dev_num,
     }
   }
   
-  if (!direct_access_) {
+  if (!FLAGS_gpugraph_enable_hbm_table_direct_access) {
     for (int i = 0; i < total_device; ++i) {
       if (h_left[i] == -1 || h_right[i] == -1) {
         continue;
@@ -1003,6 +1092,14 @@ void HeterComm<KeyType, ValType, GradType>::push_sparse(int dev_num,
       destroy_storage(dev_num, i);
     }
   }
+
+  timeline.Pause();
+  total_time += timeline.ElapsedSec();
+  finish_time += timeline.ElapsedSec();
+
+  VLOG(0) << "card:" << dev_id << ", heterps push cost " << total_time
+          << "seconds, " << " update time: " << update_time
+          << "seconds ";
 }
 
 #elif defined(PADDLE_WITH_XPU_KP)

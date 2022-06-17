@@ -184,6 +184,9 @@ void HogwildWorker::TrainFilesWithProfiler() {
               << ", mean time: " << op_total_time[i] / total_inst
               << "s, totol time:" << op_total_time[i] << "sec";
     }
+    VLOG(0) << "GpuPs worker " << thread_id_ << " train cost " << total_time
+        << " seconds, ins_num: " << total_inst << " read time: " << read_time
+        << "seconds ";
 #else
     if (thread_id_ == 0) {
       if (batch_cnt > 0 && batch_cnt % 100 == 0) {

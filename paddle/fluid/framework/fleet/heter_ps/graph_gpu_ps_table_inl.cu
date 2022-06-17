@@ -21,6 +21,7 @@
 #include "paddle/fluid/framework/fleet/heter_ps/graph_gpu_ps_table.h"
 namespace paddle {
 namespace framework {
+
 /*
 comment 0
 this kernel just serves as an example of how to sample nodes' neighbors.
